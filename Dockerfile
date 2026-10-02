@@ -2,11 +2,11 @@
 # Using the Long-Term Support (LTS) version is a good practice
 FROM node:22-slim
 
-# Install Python and yt-dlp
+# Install Python, yt-dlp and ffmpeg (ffmpeg is used for merged high-resolution streams)
 # We switch to root to perform these operations and then switch back to the node user.
 USER root
 RUN apt-get update && \
-    apt-get install -y python3 python3-pip && \
+    apt-get install -y python3 python3-pip ffmpeg && \
     pip3 install "yt-dlp[default,curl-cffi]" --break-system-packages && \
     rm -rf /var/lib/apt/lists/*
 USER node

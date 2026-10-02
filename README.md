@@ -12,6 +12,7 @@ A **Stremio addon** that lets you watch YouTube videos and access your **subscri
 - **Powerful Search** – Search for YouTube videos and channels directly within Stremio.
 - **Customizable Catalogs** – Use default catalogs or add your own custom playlists.
 - **Ad- and Click-Bait-Free** - Use **SponsorBlock** (with configurable Gemini fallback support) and/or **DeArrow** across all of YouTube.
+- **Merged High-Resolution Streams (optional)** – Enable *Merged High-Resolution Streams* in the configuration page to get 1080p+ with audio. YouTube serves these as separate video and audio tracks, so the addon combines them on the server with `ffmpeg` (stream copy, no re-encoding). This proxies media through your server; it is off by default and set `MUX_MAX` to change the concurrent limit (default 4).
 - **Secure Configuration** – User data (including cookies) is **encrypted** for security.
 - **Easy Deployment** – Deploy with **Docker**, **Node.js**, or **ngrok**.
 
@@ -72,6 +73,7 @@ docker build -t youtubio .
 - **Node.js** installed
 - **npm** package manager
 - **[YT-DLP](https://github.com/yt-dlp/yt-dlp/releases/latest)** installed
+- **[ffmpeg](https://ffmpeg.org/download.html)** installed (only needed for merged high-resolution streams; the Docker image includes it)
 
 #### ⚡ Steps
 ```bash

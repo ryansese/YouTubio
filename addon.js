@@ -29,10 +29,13 @@ const defaultConfig = {
     overestimate: false,
     markWatchedOnLoad: false,
     showBrokenLinks: false,
+    mergedStreams: false,
     search: true,
     catalogType: 'YouTube',
     geminiModel: 'gemini-2.5-pro'
 };
+const MAX_MUX = parseInt(process.env.MUX_MAX ?? 4) || 4;
+const muxFormats = { mp4: 'mp4', matroska: 'matroska' };
 const termKeyword = '{term}';
 const sortKeyword = '{sort}';
 
@@ -367,6 +370,56 @@ app.get('/stream/:url', async (req, res, next) => {
     }
 });
 
+let activeMux = 0;
+// Combine a video-only and an audio-only URL into one stream (no re-encoding)
+app.get('/mux', (req, res) => {
+    const isAllowed = value => {
+        try {
+            const u = new URL(value);
+            return u.protocol === 'https:' && (u.hostname === 'googlevideo.com' || u.hostname.endsWith('.googlevideo.com'));
+        } catch (error) {
+            return false;
+        }
+    };
+    const { v, a, f = 'mp4' } = req.query;
+    if (typeof v !== 'string' || typeof a !== 'string' || !isAllowed(v) || !isAllowed(a) || !muxFormats[f])
+        return res.status(400).send('Invalid mux request');
+    if (!hasFFmpeg()) return res.status(501).send('ffmpeg is not available');
+    if (activeMux >= MAX_MUX) return res.status(503).send('Too many active mux requests');
+    activeMux++;
+    const ffmpeg = require('child_process').spawn('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-i', v, '-i', a,
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c', 'copy',
+        ...(f === 'mp4' ? ['-movflags', 'frag_keyframe+empty_moov'] : []),
+        '-f', muxFormats[f],
+        'pipe:1'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        activeMux--;
+    };
+    ffmpeg.stderr.on('data', data => logError(new Error(`ffmpeg: ${data}`)));
+    ffmpeg.on('error', error => {
+        logError(error);
+        release();
+        if (res.headersSent) res.end(); else res.sendStatus(500);
+    });
+    ffmpeg.on('close', () => {
+        release();
+        res.end();
+    });
+    res.on('close', () => {
+        release();
+        ffmpeg.kill('SIGKILL');
+    });
+    res.set('Content-Type', f === 'mp4' ? 'video/mp4' : 'video/x-matroska');
+    ffmpeg.stdout.pipe(res);
+});
+
 // Config Encryption Endpoint
 app.post('/encrypt', (req, res, next) => {
     try {
@@ -674,6 +727,46 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res, next) => {
     }
 });
 
+/** @type {boolean?} */
+let ffmpegAvailable = null;
+/**
+ * Whether ffmpeg is on PATH (checked once, logs an error if it is missing)
+ * @returns {boolean}
+ */
+function hasFFmpeg() {
+    if (ffmpegAvailable === null) {
+        ffmpegAvailable = require('child_process').spawnSync('ffmpeg', ['-version']).status === 0;
+        if (!ffmpegAvailable) logError(new Error('ffmpeg not found on PATH; merged streams are disabled'));
+    }
+    return ffmpegAvailable;
+}
+
+/**
+ * Pair video-only formats with the best audio-only format, one pair per height (tallest first)
+ * @param {Array<Object>} formats
+ * @returns {Array<{video: Object, audio: Object, container: string}>}
+ */
+function pickMergedPairs(formats) {
+    const usable = formats.filter(f => f.url && f.protocol !== 'm3u8_native' && f.protocol !== 'm3u8');
+    const audios = usable.filter(f => f.vcodec === 'none' && f.acodec && f.acodec !== 'none');
+    const isDRC = f => /drc/i.test(f.format_id ?? '') || /drc/i.test(f.format_note ?? '');
+    const bestAudio = list => list.toSorted((a, b) => (isDRC(a) - isDRC(b)) || ((b.abr ?? 0) - (a.abr ?? 0)))[0];
+    const aac = bestAudio(audios.filter(f => f.acodec.startsWith('mp4a')));
+    const anyAudio = bestAudio(audios);
+    const byHeight = new Map();
+    for (const f of usable) {
+        if (f.format_id?.startsWith('sb') || !f.height || !f.vcodec || f.vcodec === 'none' || (f.acodec && f.acodec !== 'none')) continue;
+        byHeight.set(f.height, [...(byHeight.get(f.height) ?? []), f]);
+    }
+    return [...byHeight.entries()].sort((a, b) => b[0] - a[0]).flatMap(([, list]) => {
+        const best = fs => fs.toSorted((a, b) => (b.tbr ?? 0) - (a.tbr ?? 0))[0];
+        const h264 = best(list.filter(f => f.vcodec.startsWith('avc1')));
+        if (h264 && aac) return [{ video: h264, audio: aac, container: muxFormats.mp4 }];
+        const video = h264 ?? best(list);
+        return anyAudio ? [{ video, audio: anyAudio, container: muxFormats.matroska }] : [];
+    });
+}
+
 /**
  * Parse a YT-DLP video object into Stremio streams
  * @param {Object} userConfig
@@ -694,7 +787,19 @@ async function parseStream(userConfig, video, manifestUrl, protocol, reqProtocol
     }
     const rangesURI = ranges.length ? encodeURIComponent(JSON.stringify(ranges)) : null;
     const useID = video.webpage_url_domain === 'youtube.com';
+    const merged = (userConfig.mergedStreams ?? defaultConfig.mergedStreams) && video.formats && hasFFmpeg() ? pickMergedPairs(video.formats) : [];
     return [
+        ...merged.map(({ video: v, audio: a, container }) => ({
+            name: `Merged ${v.height}p`,
+            description: `${v.format} + ${a.format}`,
+            url: `${reqProtocol}://${reqHost}/mux?v=${encodeURIComponent(v.url)}&a=${encodeURIComponent(a.url)}&f=${container}`,
+            behaviorHints: {
+                videoSize: (v.filesize_approx ?? 0) + (a.filesize_approx ?? 0) || undefined,
+                filename: video.filename,
+                bingeGroup: `Merged ${v.height}p`,
+                notWebReady: true
+            }
+        })),
         ...(video.formats ?? [video]).filter(src => ((userConfig.showBrokenLinks ?? defaultConfig.showBrokenLinks) || (!src.format_id?.startsWith('sb') && src.acodec !== 'none' && src.vcodec !== 'none')) && src.url).toReversed().flatMap(src => {
             const base = {
                 description: src.format,
@@ -767,12 +872,14 @@ app.get('/:config/meta/:type/:id.json', async (req, res, next) => {
         const channel = useID && (channelRegex.test(video.id) || channelIDRegex.test(video.id));
         const playlist = video._type === 'playlist';
         const parseDate = video => {
-            let r = 0;
+            let r = null;
             if (d = video.release_date ?? video.upload_date)
                 r = `${d.substring(0, 4)}-${d.substring(4, 6)}-${d.substring(6, 8)}T00:00:00Z`;
             if (t = video.release_timestamp ?? video.timestamp)
                 r = t * 1000;
-            return new Date(r).toISOString();
+            // Flat playlist entries carry no date; omit it rather than reporting 1970
+            const date = r === null ? null : new Date(r);
+            return date && !isNaN(date) ? date.toISOString() : undefined;
         };
         const released = parseDate(video);
         const manifestUrl = toManifestURL(req);
@@ -1072,6 +1179,11 @@ app.get(['/', '/:config?/configure'], async (req, res) => {
                                     <td><input type="checkbox" id="showBrokenLinks" name="showBrokenLinks" data-default=0 ${userConfig.showBrokenLinks ?? defaultConfig.showBrokenLinks ? 'checked' : ''}></td>
                                     <td><label for="showBrokenLinks">Show Unsupported Streams</label></td>
                                     <td class="setting-description">Return all streams found by YT-DLP, not just ones supported by Stremio.</td>
+                                </tr>
+                                <tr>
+                                    <td><input type="checkbox" id="mergedStreams" name="mergedStreams" data-default=0 ${userConfig.mergedStreams ?? defaultConfig.mergedStreams ? 'checked' : ''}></td>
+                                    <td><label for="mergedStreams">Merged High-Resolution Streams</label></td>
+                                    <td class="setting-description">Add 1080p+ streams with audio by combining YouTube's separate video and audio tracks on this server. Requires ffmpeg and uses server bandwidth.</td>
                                 </tr>
                                 <tr>
                                     <td><input type="checkbox" id="search" name="search" data-default=1 ${userConfig.search ?? defaultConfig.search ? 'checked' : ''}></td>
@@ -1427,7 +1539,20 @@ app.get(['/', '/:config?/configure'], async (req, res) => {
                 }
                 document.getElementById('config-form').addEventListener('submit', populateInstall);
                 document.getElementById('copy-btn').addEventListener('click', async function() {
-                    await navigator.clipboard.writeText(installUrlInput.value);
+                    if (navigator.clipboard) {
+                        await navigator.clipboard.writeText(installUrlInput.value);
+                    } else {
+                        // navigator.clipboard is unavailable on non-secure (plain http) origins
+                        // The install URL input is display:none, so copy from a temporary visible textarea
+                        const temp = document.createElement('textarea');
+                        temp.value = installUrlInput.value;
+                        temp.style.position = 'fixed';
+                        temp.style.opacity = '0';
+                        document.body.appendChild(temp);
+                        temp.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(temp);
+                    }
                     this.textContent = 'Copied!';
                     setTimeout(() => { this.textContent = 'Copy URL'; }, 2000);
                 });
