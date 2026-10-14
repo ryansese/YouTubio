@@ -30,6 +30,7 @@ const defaultConfig = {
     markWatchedOnLoad: false,
     showBrokenLinks: false,
     mergedStreams: false,
+    mergedProxy: false,
     search: true,
     catalogType: 'YouTube',
     geminiModel: 'gemini-2.5-pro'
@@ -370,19 +371,42 @@ app.get('/stream/:url', async (req, res, next) => {
     }
 });
 
+/**
+ * Whether a URL is https on a googlevideo.com host
+ * @param {any} value
+ * @returns {boolean}
+ */
+function isGoogleVideoUrl(value) {
+    try {
+        const u = new URL(value);
+        return u.protocol === 'https:' && (u.hostname === 'googlevideo.com' || u.hostname.endsWith('.googlevideo.com'));
+    } catch (error) {
+        return false;
+    }
+}
+
+// Combine a video-only and an audio-only HLS playlist into one master playlist (no media passes through the addon)
+app.get('/merged.m3u8', (req, res) => {
+    const { v, a, w, h, bw, c } = req.query;
+    if (typeof v !== 'string' || typeof a !== 'string' || !isGoogleVideoUrl(v) || !isGoogleVideoUrl(a))
+        return res.status(400).send('Invalid merged request');
+    const width = parseInt(w), height = parseInt(h), bandwidth = parseInt(bw);
+    const codecs = typeof c === 'string' && /^[\w.,-]+$/.test(c) ? c : null;
+    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    return res.send([
+        '#EXTM3U',
+        `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="${new URL(a).href}"`,
+        `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth > 0 ? bandwidth : 5000000}${width > 0 && height > 0 ? `,RESOLUTION=${width}x${height}` : ''}${codecs ? `,CODECS="${codecs}"` : ''},AUDIO="a"`,
+        new URL(v).href,
+        ''
+    ].join('\n'));
+});
+
 let activeMux = 0;
 // Combine a video-only and an audio-only URL into one stream (no re-encoding)
 app.get('/mux', (req, res) => {
-    const isAllowed = value => {
-        try {
-            const u = new URL(value);
-            return u.protocol === 'https:' && (u.hostname === 'googlevideo.com' || u.hostname.endsWith('.googlevideo.com'));
-        } catch (error) {
-            return false;
-        }
-    };
     const { v, a, f = 'mp4' } = req.query;
-    if (typeof v !== 'string' || typeof a !== 'string' || !isAllowed(v) || !isAllowed(a) || !muxFormats[f])
+    if (typeof v !== 'string' || typeof a !== 'string' || !isGoogleVideoUrl(v) || !isGoogleVideoUrl(a) || !muxFormats[f])
         return res.status(400).send('Invalid mux request');
     if (!hasFFmpeg()) return res.status(501).send('ffmpeg is not available');
     if (activeMux >= MAX_MUX) return res.status(503).send('Too many active mux requests');
@@ -758,14 +782,18 @@ function hasFFmpeg() {
 /**
  * Pair video-only formats with the best audio-only format, one pair per height (tallest first)
  * @param {Array<Object>} formats
+ * @param {boolean} hls Pair HLS playlists (no server proxy) instead of DASH https files (for /mux)
  * @returns {Array<{video: Object, audio: Object, container: string}>}
  */
-function pickMergedPairs(formats) {
-    const usable = formats.filter(f => f.url && f.protocol !== 'm3u8_native' && f.protocol !== 'm3u8');
-    const audios = usable.filter(f => f.vcodec === 'none' && f.acodec && f.acodec !== 'none');
+function pickMergedPairs(formats, hls) {
+    const isHls = f => f.protocol === 'm3u8_native' || f.protocol === 'm3u8';
+    const usable = formats.filter(f => f.url && isHls(f) === hls);
+    // yt-dlp leaves acodec/abr unset on HLS audio-only formats (audio_ext is mp4, i.e. AAC)
+    const audios = usable.filter(f => f.vcodec === 'none' && (hls ? f.audio_ext && f.audio_ext !== 'none' : f.acodec && f.acodec !== 'none'));
     const isDRC = f => /drc/i.test(f.format_id ?? '') || /drc/i.test(f.format_note ?? '');
-    const bestAudio = list => list.toSorted((a, b) => (isDRC(a) - isDRC(b)) || ((b.abr ?? 0) - (a.abr ?? 0)))[0];
-    const aac = bestAudio(audios.filter(f => f.acodec.startsWith('mp4a')));
+    const isHigh = f => /high/i.test(f.format_note ?? '');
+    const bestAudio = list => list.toSorted((a, b) => (isDRC(a) - isDRC(b)) || (isHigh(b) - isHigh(a)) || ((b.abr ?? 0) - (a.abr ?? 0)))[0];
+    const aac = bestAudio(audios.filter(f => hls ? f.audio_ext === 'mp4' : f.acodec.startsWith('mp4a')));
     const anyAudio = bestAudio(audios);
     const byHeight = new Map();
     for (const f of usable) {
@@ -776,7 +804,9 @@ function pickMergedPairs(formats) {
         const best = fs => fs.toSorted((a, b) => (b.tbr ?? 0) - (a.tbr ?? 0))[0];
         const h264 = best(list.filter(f => f.vcodec.startsWith('avc1')));
         if (h264 && aac) return [{ video: h264, audio: aac, container: muxFormats.mp4 }];
-        const video = h264 ?? best(list);
+        // HLS audio is always AAC; only fall back to VP9 (AV1 is not offered over HLS)
+        const video = h264 ?? best(hls ? list.filter(f => f.vcodec.startsWith('vp09')) : list);
+        if (!video) return [];
         return anyAudio ? [{ video, audio: anyAudio, container: muxFormats.matroska }] : [];
     });
 }
@@ -801,12 +831,15 @@ async function parseStream(userConfig, video, manifestUrl, protocol, reqProtocol
     }
     const rangesURI = ranges.length ? encodeURIComponent(JSON.stringify(ranges)) : null;
     const useID = video.webpage_url_domain === 'youtube.com';
-    const merged = (userConfig.mergedStreams ?? defaultConfig.mergedStreams) && video.formats && hasFFmpeg() ? pickMergedPairs(video.formats) : [];
+    const proxyMerged = userConfig.mergedProxy ?? defaultConfig.mergedProxy;
+    const merged = (userConfig.mergedStreams ?? defaultConfig.mergedStreams) && video.formats && (!proxyMerged || hasFFmpeg()) ? pickMergedPairs(video.formats, !proxyMerged) : [];
     return [
         ...merged.map(({ video: v, audio: a, container }) => ({
             name: `Merged ${v.height}p`,
             description: `${v.format} + ${a.format}`,
-            url: `${reqProtocol}://${reqHost}/mux?v=${encodeURIComponent(v.url)}&a=${encodeURIComponent(a.url)}&f=${container}`,
+            url: proxyMerged
+                ? `${reqProtocol}://${reqHost}/mux?v=${encodeURIComponent(v.url)}&a=${encodeURIComponent(a.url)}&f=${container}`
+                : `${reqProtocol}://${reqHost}/merged.m3u8?v=${encodeURIComponent(v.url)}&a=${encodeURIComponent(a.url)}&w=${v.width ?? ''}&h=${v.height}&bw=${Math.round((v.tbr ?? 0) * 1000)}&c=${encodeURIComponent([v.vcodec, a.acodec ?? 'mp4a.40.2'].join(','))}`,
             behaviorHints: {
                 videoSize: (v.filesize_approx ?? 0) + (a.filesize_approx ?? 0) || undefined,
                 filename: video.filename,
@@ -1197,7 +1230,12 @@ app.get(['/', '/:config?/configure'], async (req, res) => {
                                 <tr>
                                     <td><input type="checkbox" id="mergedStreams" name="mergedStreams" data-default=0 ${userConfig.mergedStreams ?? defaultConfig.mergedStreams ? 'checked' : ''}></td>
                                     <td><label for="mergedStreams">Merged High-Resolution Streams</label></td>
-                                    <td class="setting-description">Add 1080p+ streams with audio by combining YouTube's separate video and audio tracks on this server. Requires ffmpeg and uses server bandwidth.</td>
+                                    <td class="setting-description">Add 1080p+ streams with audio by combining YouTube's separate video and audio tracks. The player downloads directly from YouTube, so this only works when Stremio is on the same network (public IP) as the addon.</td>
+                                </tr>
+                                <tr>
+                                    <td><input type="checkbox" id="mergedProxy" name="mergedProxy" data-default=0 ${userConfig.mergedProxy ?? defaultConfig.mergedProxy ? 'checked' : ''}></td>
+                                    <td><label for="mergedProxy">Proxy Merged Streams</label></td>
+                                    <td class="setting-description">Combine the tracks on this server instead, so merged streams work from any network. Requires ffmpeg and uses server bandwidth.</td>
                                 </tr>
                                 <tr>
                                     <td><input type="checkbox" id="search" name="search" data-default=1 ${userConfig.search ?? defaultConfig.search ? 'checked' : ''}></td>
