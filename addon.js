@@ -649,6 +649,19 @@ function toChannelManifestURL(userConfig, video, manifestUrl, protocol, useID) {
     return `${protocol}/discover/${manifestUrl}/${userConfig.catalogType ?? defaultConfig.catalogType}/${encodeURIComponent(prefix + (useID ? video.channel_id : video.channel_url))}`;
 }
 
+/** Titles yt-dlp gives to deleted or private videos in flat playlists. */
+const unavailableTitles = new Set(['[deleted video]', '[private video]']);
+
+/**
+ * Whether a raw yt-dlp entry is an unavailable video (deleted, private, or untitled).
+ * @param {Object} video
+ * @returns {boolean}
+ */
+function isUnavailable(video) {
+    const title = typeof video?.title === 'string' ? video.title.trim().toLowerCase() : '';
+    return !title || unavailableTitles.has(title);
+}
+
 /**
  * Parse a YT-DLP video object into Stremio meta
  * @param {Object} userConfig
@@ -717,6 +730,7 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res, next) => {
         return res.json({
             metas: (await Promise.all(
                 (playlist ? videos.entries : [videos])
+                    .filter(video => !isUnavailable(video))
                     .map(video => parseMeta(userConfig, video, toManifestURL(req), protocol, useID, req.params.id, playlist, req.params.type))
             )).filter(meta => meta !== null),
             behaviorHints: { cacheMaxAge: canCache ? process.env.TTL ?? 3600 : 0 }
